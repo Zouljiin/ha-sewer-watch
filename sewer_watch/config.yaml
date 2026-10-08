@@ -1,5 +1,5 @@
 name: Sewer Watch
-version: "1.1.1"
+version: "1.2.0"
 slug: sewer_watch
 description: >-
   Watches Spencer County KY Fiscal Court agendas, minutes and notices,
@@ -15,6 +15,9 @@ startup: application
 boot: auto
 homeassistant_api: true
 hassio_api: true
+map:
+  - type: homeassistant_config
+    read_only: false
 ingress: true
 ingress_port: 8099
 panel_icon: mdi:pipe-leak

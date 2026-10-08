@@ -13,8 +13,11 @@ about the sewer project shows up.
 
 It downloads each PDF and reads the text, using OCR when the county posts a
 scan. It then searches for your keywords and sends a push with the matching
-passages. The push has buttons for **Open PDF**, **Watch meeting**, and
-**Sewer Watch reader**.
+passages and a picture of the page with the mention highlighted. The push has
+buttons for **Open PDF**, **Watch meeting**, and **Sewer Watch reader**.
+
+In the reader, every document is shown as its real pages, with keywords
+highlighted in yellow.
 
 ## Install
 
@@ -61,6 +64,10 @@ from a list of your phones.
   `message`, `links`, and `important`). You can build your own automations on
   it, such as flashing a light or sending a TTS announcement.
 - Alerts also land in **Notifications** (full text) and the **Logbook**.
+
+Alert pictures are saved in `www/sewer_watch/` in your HA config folder, which
+keeps the last 40. They're served at `/local/sewer_watch/` so your phone can
+show them.
 
 ## Limits
 

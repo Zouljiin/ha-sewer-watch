@@ -11,6 +11,7 @@ Standard library only.
 """
 import hashlib
 import html
+import io
 import json
 import os
 import re
@@ -275,9 +276,9 @@ def kw_patterns():
     return pats
 
 
-def find_hits(text, max_snips=8, radius=170):
+def find_hits(text, max_snips=8, radius=170, with_pages=False):
     if not text:
-        return [], []
+        return ([], [], []) if with_pages else ([], [])
     spans, matched = [], []
     for k, rx in kw_patterns():
         for m in rx.finditer(text):
@@ -291,8 +292,9 @@ def find_hits(text, max_snips=8, radius=170):
             merged[-1] = (merged[-1][0], max(e, merged[-1][1]))
         else:
             merged.append((s, e))
-    snips = []
+    snips, pages = [], []
     for s, e in merged[:max_snips]:
+        pages.append(text.count("\f", 0, s + radius // 2) + 1)
         # start/end on sentence boundaries when one is close by
         head = text[s:s + radius]
         m = re.search(r"[.;:]\s+(?=[A-Z0-9])", head)
@@ -306,7 +308,7 @@ def find_hits(text, max_snips=8, radius=170):
             e = max(s, e - radius) + m.start() + 1
         snip = re.sub(r"\s+", " ", text[s:e]).strip()
         snips.append(("…" if s > 0 else "") + snip + ("…" if e < len(text) else ""))
-    return matched, snips
+    return (matched, snips, pages) if with_pages else (matched, snips)
 
 
 # --------------------------------------------------------------------------
@@ -341,6 +343,157 @@ def pdf_text(data):
         except Exception as e:  # noqa: BLE001
             log("OCR failed:", e)
         return text, "text"
+
+
+# --------------------------------------------------------------------------
+# Page images (the real document, with keywords highlighted)
+# --------------------------------------------------------------------------
+PDF_DIR = os.path.join(DATA_DIR, "pdf")
+PAGE_DIR = os.path.join(DATA_DIR, "pages")
+WWW_DIR = os.environ.get("SW_WWW", "/homeassistant/www/sewer_watch")   # served by HA as /local/...
+WWW_URL = "/local/sewer_watch"
+PAGE_DPI = 150
+RENDER_SLOTS = threading.Semaphore(2)    # keep a Raspberry Pi responsive
+
+
+def pdf_file(row_id, url=None, data=None):
+    """Local copy of the document's PDF (downloaded if missing)."""
+    path = os.path.join(PDF_DIR, f"{row_id}.pdf")
+    if data is None and not os.path.exists(path) and url:
+        data = fetch(url, binary=True, limit=MAX_PDF_BYTES)
+    if data is not None:
+        os.makedirs(PDF_DIR, exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(data)
+        for old in os.listdir(PAGE_DIR) if os.path.isdir(PAGE_DIR) else []:
+            if old.startswith(f"{row_id}_"):
+                os.remove(os.path.join(PAGE_DIR, old))
+    return path if os.path.exists(path) else None
+
+
+def page_count(path):
+    try:
+        out = subprocess.run(["pdfinfo", path], capture_output=True, timeout=60).stdout.decode("utf-8", "replace")
+        m = re.search(r"^Pages:\s+(\d+)", out, re.M)
+        return int(m.group(1)) if m else 0
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def page_png(path, page, dpi=PAGE_DPI):
+    with tempfile.TemporaryDirectory() as td:
+        base = os.path.join(td, "p")
+        subprocess.run(["pdftoppm", "-f", str(page), "-l", str(page), "-r", str(dpi), "-png", "-singlefile",
+                        path, base], check=True, timeout=300, capture_output=True)
+        with open(base + ".png", "rb") as f:
+            return f.read()
+
+
+def word_boxes(png):
+    """OCR word positions on a rendered page: [(normalized_word, (x0,y0,x1,y1))]."""
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+        f.write(png)
+        fn = f.name
+    try:
+        out = subprocess.run(["tesseract", fn, "-", "--psm", "3", "tsv"], capture_output=True,
+                             timeout=300).stdout.decode("utf-8", "replace")
+    finally:
+        os.unlink(fn)
+    words = []
+    for line in out.splitlines()[1:]:
+        p = line.split("\t")
+        if len(p) >= 12 and p[0] == "5" and p[11].strip():
+            x, y, w, h = (int(v) for v in p[6:10])
+            words.append((re.sub(r"[^a-z0-9]", "", p[11].lower()), (x, y, x + w, y + h)))
+    return words
+
+
+def keyword_boxes(words, keywords=None):
+    boxes = []
+    for kw in keywords or OPTS["keywords"]:
+        toks = re.findall(r"[a-z0-9]+", kw.lower())
+        n = len(toks)
+        if not n:
+            continue
+        for i in range(len(words) - n + 1):
+            if all((words[i + j][0].startswith(toks[j]) if j == n - 1 else words[i + j][0] == toks[j])
+                   for j in range(n)):
+                bs = [words[i + j][1] for j in range(n)]
+                boxes.append((min(b[0] for b in bs), min(b[1] for b in bs),
+                              max(b[2] for b in bs), max(b[3] for b in bs)))
+    return boxes
+
+
+def highlighted(png, boxes):
+    from PIL import Image, ImageDraw   # py3-pillow
+    im = Image.open(io.BytesIO(png)).convert("RGBA")
+    ov = Image.new("RGBA", im.size, (0, 0, 0, 0))
+    d = ImageDraw.Draw(ov)
+    for x0, y0, x1, y1 in boxes:
+        d.rectangle((x0 - 5, y0 - 4, x1 + 5, y1 + 4), fill=(255, 225, 0, 105), outline=(235, 110, 0, 255), width=3)
+    return Image.alpha_composite(im, ov).convert("RGB")
+
+
+def hit_pages(text):
+    pages = set()
+    for _, rx in kw_patterns():
+        for m in rx.finditer(text or ""):
+            pages.add(text.count("\f", 0, m.start()) + 1)
+    return pages
+
+
+def first_hit_page(text):
+    pos = [m.start() for _, rx in kw_patterns() for m in rx.finditer(text or "")]
+    return (text.count("\f", 0, min(pos)) + 1) if pos else 1
+
+
+def page_image(r, page):
+    """JPEG of one page for the reader, keywords highlighted. Cached on disk."""
+    os.makedirs(PAGE_DIR, exist_ok=True)
+    cache = os.path.join(PAGE_DIR, f"{r['id']}_{r['ver'] or 0}_{page}.jpg")
+    if os.path.exists(cache):
+        with open(cache, "rb") as f:
+            return f.read()
+    with RENDER_SLOTS:
+        path = pdf_file(r["id"], r["url"])
+        png = page_png(path, page)
+        from PIL import Image
+        if page in hit_pages(r["text"]):
+            im = highlighted(png, keyword_boxes(word_boxes(png)))
+        else:
+            im = Image.open(io.BytesIO(png)).convert("RGB")
+        im.save(cache, "JPEG", quality=72, optimize=True)
+    with open(cache, "rb") as f:
+        return f.read()
+
+
+def alert_image(r):
+    """Crop of the page with the first mention, highlighted, published under /local for the phone."""
+    try:
+        if not os.path.isdir(os.path.dirname(WWW_DIR)):
+            return None
+        with RENDER_SLOTS:
+            path = pdf_file(r["id"], r["url"])
+            page = first_hit_page(r["text"])
+            png = page_png(path, page)
+            boxes = keyword_boxes(word_boxes(png))
+            im = highlighted(png, boxes)
+        w, h = im.size
+        band = int(PAGE_DPI * 4.5)          # ~4.5 inches of the page around the mention
+        cy = (boxes[0][1] + boxes[0][3]) // 2 if boxes else band // 2
+        top = max(0, min(h - band, cy - band // 2))
+        im = im.crop((0, top, w, min(h, top + band)))
+        os.makedirs(WWW_DIR, exist_ok=True)
+        name = f"doc{r['id']}_{int(time.time())}.jpg"
+        im.save(os.path.join(WWW_DIR, name), "JPEG", quality=78, optimize=True)
+        # keep the folder small
+        files = sorted(os.listdir(WWW_DIR), key=lambda n: os.path.getmtime(os.path.join(WWW_DIR, n)))
+        for old in files[:-40]:
+            os.remove(os.path.join(WWW_DIR, old))
+        return f"{WWW_URL}/{name}"
+    except Exception as e:  # noqa: BLE001
+        log("alert image failed:", e)
+        return None
 
 
 # --------------------------------------------------------------------------
@@ -428,7 +581,7 @@ def list_notify_services():
     return out
 
 
-def notify(title, message, links=None, full=None, important=False):
+def notify(title, message, links=None, full=None, important=False, image=None):
     """Phone push (short) + persistent notification (full) + event + logbook."""
     links = [l for l in (links or []) if l and l[1]]
     phone_msg = message if len(message) <= 1000 else message[:997] + "…"
@@ -438,22 +591,22 @@ def notify(title, message, links=None, full=None, important=False):
     if not targets:
         log("no alert targets chosen yet - only creating a persistent notification")
     for svc in targets:
-        ha_call("POST", "/services/notify/" + svc, {
-            "title": title,
-            "message": phone_msg,
-            "data": {
-                "url": first, "clickAction": first,
-                "actions": actions,
-                "group": "sewer_watch",
-                "priority": "high" if important else "normal",
-                "ttl": 0,
-                "push": {"interruption-level": "time-sensitive" if important else "active"},
-            },
-        })
+        data = {
+            "url": first, "clickAction": first,
+            "actions": actions,
+            "group": "sewer_watch",
+            "priority": "high" if important else "normal",
+            "ttl": 0,
+            "push": {"interruption-level": "time-sensitive" if important else "active"},
+        }
+        if image:
+            data["image"] = image            # picture of the page, shown in the notification
+        ha_call("POST", "/services/notify/" + svc, {"title": title, "message": phone_msg, "data": data})
     md_links = "\n".join(f"- [{t}]({u})" for t, u in links)
     ha_call("POST", "/services/persistent_notification/create", {
         "title": title,
-        "message": (full or message) + ("\n\n" + md_links if md_links else ""),
+        "message": (full or message) + (f"\n\n![page]({image})" if image else "")
+                   + ("\n\n" + md_links if md_links else ""),
     })
     ha_call("POST", "/services/logbook/log", {"name": "Sewer Watch", "message": title})
     ha_call("POST", "/events/sewer_watch_alert", {
@@ -582,6 +735,7 @@ def index_doc(row_id):
         return None
     try:
         data = fetch(r["url"], binary=True, limit=MAX_PDF_BYTES)
+        pdf_file(row_id, data=data)          # keep a copy so the reader can show real pages
         text, how = pdf_text(data)
         hits, snips = find_hits(text)
         with DB_LOCK, db() as c:
@@ -652,7 +806,10 @@ def alert_doc(r, change, prev_hits=None):
         if r["status"] == "error":
             body = "Couldn't read this PDF - open it directly."
         full = body + f"\n\nSource: {r['source']}"
-    notify(title, body, doc_links(r), full=full, important=bool(hits) and hits != (prev_hits or []))
+    image = alert_image(r) if hits else None
+    if hits:
+        body = f"Page {first_hit_page(r['text'])} · " + body
+    notify(title, body, doc_links(r), full=full, important=bool(hits) and hits != (prev_hits or []), image=image)
 
 
 # --------------------------------------------------------------------------
@@ -865,6 +1022,8 @@ pre{white-space:pre-wrap;word-wrap:break-word;background:var(--card);border:1px 
 .err{color:var(--bad)}label{font-size:14px;color:var(--mut)}
 .picks{display:flex;flex-wrap:wrap;gap:6px 18px;margin-top:8px}.pick{color:var(--fg);font-size:15px;cursor:pointer}
 .pick input{width:18px;height:18px;vertical-align:-3px}
+.pg{margin:14px 0}.pg img{display:block;width:100%;max-width:900px;min-height:200px;background:#fff;border:1px solid var(--line);border-radius:6px;margin-top:4px}
+details{margin:20px 0}summary{cursor:pointer;color:var(--mut)}
 """
 
 
@@ -960,9 +1119,8 @@ def render_doc(doc_id):
         return page_shell("Not found", '<p><a href="./">← back</a></p><p>Not found.</p>')
     if r["status"] in ("listed", "error"):
         r = index_doc(doc_id) or r
-    hits = json.loads(r["hits"] or "[]")
-    snips = json.loads(r["snippets"] or "[]")
-    links = f'<a href="{html.escape(r["url"])}" target="_blank">Open PDF</a>'
+    hits, snips, spages = find_hits(r["text"] or "", with_pages=True)
+    links = f'<a href="{html.escape(r["url"])}" target="_blank">Open original PDF</a>'
     if r["video"]:
         links += f' · <a href="{html.escape(r["video"])}" target="_blank">Meeting video</a>'
     if r["details"]:
@@ -972,12 +1130,31 @@ def render_doc(doc_id):
             f'{html.escape(r["source"] or "")} · found {html.escape(r["found_at"] or "")}</div><p class="links">{links}</p>']
     if hits:
         body.append("<h2>Sewer-related mentions</h2>" + "".join(f'<span class="tag">{html.escape(h)}</span>' for h in hits))
-        body += [f"<blockquote>{hl(s)}</blockquote>" for s in snips]
+        body += [f'<blockquote><a href="#p{p}"><b>Page {p}</b></a> &nbsp;{hl(s)}</blockquote>' for s, p in zip(snips, spages)]
     elif r["status"] == "indexed":
         body.append('<div class="card meta">No sewer keywords in this document.</div>')
     if r["status"] == "error":
-        body.append('<div class="card err">Could not read this PDF. Use "Open PDF".</div>')
-    body.append(f"<h2>Full text</h2><pre>{hl(r['text'] or '')}</pre>")
+        body.append('<div class="card err">Could not read this PDF. Use "Open original PDF".</div>')
+    try:
+        path = pdf_file(r["id"], r["url"])
+        n = page_count(path) if path else 0
+    except Exception as e:  # noqa: BLE001
+        log("could not get PDF for reader:", e)
+        n = 0
+    if n:
+        marked = hit_pages(r["text"])
+        body.append(f"<h2>Document ({n} page{'s' if n != 1 else ''})</h2>")
+        if marked:
+            body.append('<div class="meta">Mentions are highlighted in yellow. Pages with mentions take a few seconds to prepare the first time.</div>')
+        for p in range(1, min(n, 80) + 1):
+            tag = ' <span class="tag">mentions</span>' if p in marked else ""
+            body.append(f'<div class="pg" id="p{p}"><div class="meta">Page {p}{tag}</div>'
+                        f'<img loading="lazy" src="page?id={r["id"]}&amp;p={p}&amp;v={html.escape(r["ver"] or "0")}" '
+                        f'alt="Page {p}"></div>')
+        if n > 80:
+            body.append('<div class="meta">Only the first 80 pages are shown – open the original PDF for the rest.</div>')
+    body.append('<details><summary>Searchable text (as read by OCR – tables and stamps can come out garbled)</summary>'
+                f"<pre>{hl(r['text'] or '')}</pre></details>")
     return page_shell(r["title"] or "Document", "".join(body))
 
 
@@ -1013,6 +1190,19 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if path == "doc":
                 self._send(render_doc(int(q.get("id", ["0"])[0])))
+            elif path == "page":
+                with DB_LOCK, db() as c:
+                    r = c.execute("SELECT * FROM docs WHERE id=?", (int(q.get("id", ["0"])[0]),)).fetchone()
+                if r is None:
+                    self._send("not found", 404, "text/plain")
+                    return
+                data = page_image(r, int(q.get("p", ["1"])[0]))
+                self.send_response(200)
+                self.send_header("Content-Type", "image/jpeg")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Cache-Control", "max-age=86400")
+                self.end_headers()
+                self.wfile.write(data)
             elif path == "agenda":
                 self._send(render_agenda())
             elif path == "api":
@@ -1061,8 +1251,8 @@ def send_test():
         hits = json.loads(r["hits"])
         snips = json.loads(r["snippets"] or "[]")
         notify(f"TEST – latest mention: {r['title']} ({fmt_date(r['meeting_date'])})",
-               "Mentions: " + ", ".join(hits) + ("\n\n• " + snips[0] if snips else ""),
-               doc_links(r), important=True)
+               f"Page {first_hit_page(r['text'])} · Mentions: " + ", ".join(hits) + ("\n\n• " + snips[0] if snips else ""),
+               doc_links(r), important=True, image=alert_image(r))
     else:
         notify("TEST – Sewer Watch works", "No sewer mentions found in the documents read so far.",
                [("Sewer Watch reader", INGRESS_PANEL), ("Fiscal Court agenda", AGENDA_URL)], important=True)

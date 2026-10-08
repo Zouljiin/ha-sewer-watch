@@ -4,6 +4,7 @@ FROM $BUILD_FROM
 # Python (stdlib only), PDF text extraction, and OCR for scanned minutes
 RUN apk add --no-cache \
       python3 \
+      py3-pillow \
       poppler-utils \
       tesseract-ocr \
       tesseract-ocr-data-eng
