@@ -41,7 +41,24 @@ DATA_DIR = os.environ.get("SW_DATA", "/data")
 OPTIONS_FILE = os.path.join(DATA_DIR, "options.json")
 DB_FILE = os.path.join(DATA_DIR, "sewer_watch.db")
 DRY_RUN = os.environ.get("SW_DRY") == "1"          # print instead of calling HA
-TOKEN = os.environ.get("SUPERVISOR_TOKEN", "")
+def _supervisor_token():
+    """The base image's s6 init can strip env vars; it also saves them to files."""
+    t = os.environ.get("SUPERVISOR_TOKEN") or os.environ.get("HASSIO_TOKEN") or ""
+    for f in ("/run/s6/container_environment/SUPERVISOR_TOKEN",
+              "/var/run/s6/container_environment/SUPERVISOR_TOKEN",
+              "/run/s6/container_environment/HASSIO_TOKEN"):
+        if t:
+            break
+        try:
+            with open(f) as fh:
+                t = fh.read().strip()
+        except OSError:
+            pass
+    return t
+
+
+TOKEN = _supervisor_token()
+LAST_HA_ERROR = ""
 HA_API = "http://supervisor/core/api"
 UA = "Mozilla/5.0 (Home Assistant Sewer Watch add-on)"
 MAX_PDF_BYTES = 60 * 1024 * 1024
@@ -333,18 +350,33 @@ INGRESS_PANEL = "/hassio/ingress/local_sewer_watch"
 
 
 def ha_call(method, path, body=None, base=HA_API):
+    global LAST_HA_ERROR
     if DRY_RUN:
         log("[DRY]", method, path, json.dumps(body, ensure_ascii=False)[:3000])
         return None
+    if not TOKEN:
+        LAST_HA_ERROR = "the app has no Home Assistant access token (SUPERVISOR_TOKEN missing)"
+        log("HA call skipped:", LAST_HA_ERROR)
+        return None
+    headers = {"Authorization": "Bearer " + TOKEN}
+    if body is not None:
+        headers["Content-Type"] = "application/json"
     req = Request(base + path, method=method,
-                  data=json.dumps(body).encode() if body is not None else None,
-                  headers={"Authorization": "Bearer " + TOKEN, "Content-Type": "application/json"})
+                  data=json.dumps(body).encode() if body is not None else None, headers=headers)
     try:
         with urlopen(req, timeout=30) as r:
             raw = r.read()
+            LAST_HA_ERROR = ""
             return json.loads(raw) if raw else None
     except Exception as e:  # noqa: BLE001
-        log("HA call failed:", method, path, e)
+        detail = ""
+        if hasattr(e, "read"):
+            try:
+                detail = e.read().decode("utf-8", "replace")[:200]
+            except Exception:  # noqa: BLE001
+                pass
+        LAST_HA_ERROR = f"{method} {path}: {e} {detail}".strip()
+        log("HA call failed:", LAST_HA_ERROR)
         return None
 
 
@@ -387,7 +419,7 @@ def list_notify_services():
                 ("alexa_media_kitchen", nice_target("alexa_media_kitchen"))]
     data = ha_call("GET", "/services") or []
     out = []
-    for dom in data:
+    for dom in data if isinstance(data, list) else []:
         if dom.get("domain") == "notify":
             for svc in dom.get("services", {}):
                 if svc not in SKIP_NOTIFY:
@@ -902,8 +934,11 @@ def render_targets():
     services = list_notify_services()
     known = {s for s, _ in services}
     services += [(s, nice_target(s) + " – not found in HA") for s in chosen if s not in known]
-    if not services:
-        boxes = '<div class="meta">Home Assistant didn\'t report any notify targets. Install the HA Companion app on your phone and log in, then reload this page.</div>'
+    if not services and LAST_HA_ERROR:
+        boxes = (f'<div class="err">Couldn\'t get the list of phones from Home Assistant: '
+                 f'{html.escape(LAST_HA_ERROR)}</div>')
+    elif not services:
+        boxes = '<div class="meta">Home Assistant reported no notify targets. Install the HA Companion app on your phone and log in, then reload this page.</div>'
     else:
         boxes = "".join(
             f'<label class="pick"><input type="checkbox" name="target" value="{html.escape(s)}"'
@@ -911,7 +946,10 @@ def render_targets():
             for s, label in services)
     warn = "" if chosen else '<div class="err"><b>Pick at least one phone, or you\'ll only get alerts inside Home Assistant.</b></div>'
     return f"""<form class="card" method="post" action="targets"><b>Send alerts to</b>{warn}
-<div class="picks">{boxes}</div><div class="bar" style="margin:8px 0 0">
+<div class="picks">{boxes}</div>
+<div class="bar" style="margin:8px 0 0"><label>Or type one:</label>
+<input type="text" name="manual" placeholder="e.g. mobile_app_pixel_8" style="padding:6px 8px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--fg);min-width:220px"></div>
+<div class="bar" style="margin:8px 0 0">
 <button>Save</button><button formaction="targets?test=1">Save &amp; send test</button></div></form>"""
 
 
@@ -993,7 +1031,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "targets":
             n = int(self.headers.get("Content-Length") or 0)
             form = parse_qs(self.rfile.read(n).decode() if n else "")
-            chosen = [t for t in form.get("target", []) if re.fullmatch(r"[a-z0-9_]+", t)]
+            raw = form.get("target", []) + [m.strip().lower().replace("notify.", "", 1)
+                                            for m in form.get("manual", []) if m.strip()]
+            chosen = list(dict.fromkeys(t for t in raw if re.fullmatch(r"[a-z0-9_]+", t)))
             kv_set("notify_targets", json.dumps(chosen))
             log("alert targets:", chosen)
             if chosen:
@@ -1032,6 +1072,7 @@ def send_test():
 def main():
     db_init()
     log("Sewer Watch starting; keywords:", ", ".join(OPTS["keywords"]))
+    log("Home Assistant access token:", "present" if TOKEN else "MISSING - alerts and phone list will not work")
     if not DRY_RUN:
         detect_panel()
     port = int(os.environ.get("SW_PORT", "8099"))
