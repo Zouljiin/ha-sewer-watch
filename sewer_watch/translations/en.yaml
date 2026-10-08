@@ -1,0 +1,22 @@
+configuration:
+  check_interval_minutes:
+    name: How often to check the county site (minutes)
+    description: The county posts agendas a few days before each meeting. 180 = every 3 hours.
+  backfill_months:
+    name: How many months of past documents to read on first start
+    description: Older documents are still listed in the panel and are read when you open them.
+  ocr:
+    name: Read scanned PDFs (OCR)
+    description: County minutes are often scans. Slower on a Raspberry Pi, but otherwise they can't be searched.
+  notify_every_new_document:
+    name: Alert on every new county document
+    description: Turn off to only be alerted when a document mentions one of your keywords.
+  meeting_day_reminder:
+    name: Remind me on the morning of a Fiscal Court meeting
+    description: Includes the livestream link and whether sewer items are on the agenda.
+  keywords:
+    name: Words to watch for
+    description: Not case-sensitive. A document or agenda mentioning any of these triggers a high-priority alert.
+  extra_pages:
+    name: Extra web pages to watch for new PDFs
+    description: Optional. Full links to any other county or utility page that posts documents.

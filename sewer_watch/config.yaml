@@ -1,5 +1,5 @@
 name: Sewer Watch
-version: "1.0.0"
+version: "1.1.0"
 slug: sewer_watch
 description: >-
   Watches Spencer County KY Fiscal Court agendas, minutes and notices,
@@ -20,7 +20,6 @@ ingress_port: 8099
 panel_icon: mdi:pipe-leak
 panel_title: Sewer Watch
 options:
-  notify_service: "mobile_app_CHANGE_ME"
   check_interval_minutes: 180
   backfill_months: 12
   ocr: true
@@ -53,7 +52,6 @@ options:
     - division of water
   extra_pages: []
 schema:
-  notify_service: str
   check_interval_minutes: int(30,1440)
   backfill_months: int(0,180)
   ocr: bool

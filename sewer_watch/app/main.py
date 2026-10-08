@@ -358,16 +358,54 @@ def detect_panel():
         pass
 
 
+SKIP_NOTIFY = {"notify", "send_message", "persistent_notification"}
+
+
+def get_targets():
+    """Notify services chosen in the panel (falls back to a legacy option)."""
+    try:
+        t = json.loads(kv_get("notify_targets", "") or "null")
+        if isinstance(t, list):
+            return t
+    except ValueError:
+        pass
+    legacy = (OPTS.get("notify_service") or "").strip().replace("notify.", "", 1)
+    return [legacy] if legacy and legacy != "mobile_app_CHANGE_ME" else []
+
+
+def nice_target(svc):
+    if svc.startswith("mobile_app_"):
+        return svc[len("mobile_app_"):].replace("_", " ").title() + " (phone app)"
+    return svc.replace("_", " ").title()
+
+
+def list_notify_services():
+    """[(service, label)] for every notify service HA knows, phones first."""
+    if DRY_RUN:
+        return [("mobile_app_pixel_8", nice_target("mobile_app_pixel_8")),
+                ("mobile_app_nathans_iphone", nice_target("mobile_app_nathans_iphone")),
+                ("alexa_media_kitchen", nice_target("alexa_media_kitchen"))]
+    data = ha_call("GET", "/services") or []
+    out = []
+    for dom in data:
+        if dom.get("domain") == "notify":
+            for svc in dom.get("services", {}):
+                if svc not in SKIP_NOTIFY:
+                    out.append((svc, nice_target(svc)))
+    out.sort(key=lambda x: (not x[0].startswith("mobile_app_"), x[1].lower()))
+    return out
+
+
 def notify(title, message, links=None, full=None, important=False):
     """Phone push (short) + persistent notification (full) + event + logbook."""
     links = [l for l in (links or []) if l and l[1]]
     phone_msg = message if len(message) <= 1000 else message[:997] + "…"
     actions = [{"action": "URI", "title": t[:24], "uri": u} for t, u in links[:3]]
     first = links[0][1] if links else INGRESS_PANEL
-    svc = OPTS.get("notify_service", "").strip()
-    if svc.startswith("notify."):
-        svc = svc[7:]
-    if svc and svc != "mobile_app_CHANGE_ME":
+    targets = get_targets()
+    if not targets:
+        log("no alert targets chosen yet - only creating a persistent notification")
+    for svc in targets:
         ha_call("POST", "/services/notify/" + svc, {
             "title": title,
             "message": phone_msg,
@@ -380,8 +418,6 @@ def notify(title, message, links=None, full=None, important=False):
                 "push": {"interruption-level": "time-sensitive" if important else "active"},
             },
         })
-    else:
-        log("notify_service not set - only creating a persistent notification")
     md_links = "\n".join(f"- [{t}]({u})" for t, u in links)
     ha_call("POST", "/services/persistent_notification/create", {
         "title": title,
@@ -795,6 +831,8 @@ button,.btn{padding:7px 12px;border:1px solid var(--line);border-radius:8px;back
 blockquote{margin:8px 0;padding:6px 10px;border-left:3px solid var(--acc);background:var(--bg);border-radius:4px}
 pre{white-space:pre-wrap;word-wrap:break-word;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px;font-size:13px}
 .err{color:var(--bad)}label{font-size:14px;color:var(--mut)}
+.picks{display:flex;flex-wrap:wrap;gap:6px 18px;margin-top:8px}.pick{color:var(--fg);font-size:15px;cursor:pointer}
+.pick input{width:18px;height:18px;vertical-align:-3px}
 """
 
 
@@ -827,6 +865,7 @@ def render_list(q, only_hits, flash=""):
     out = [f"<h1>Sewer Watch</h1>"]
     if flash:
         out.append(f'<div class="card">{html.escape(flash)}</div>')
+    out.append(render_targets())
     out.append(f"""<div class="card"><b>Current agenda:</b> {html.escape(fmt_date(adate))} &nbsp;
 <span class="meta">sewer keywords: {html.escape(ahits or '—')}</span> &nbsp; <a href="agenda">Read it</a> ·
 <a href="{AGENDA_URL}" target="_blank">County page</a> · <a href="{YOUTUBE_URL}" target="_blank">Livestream</a> ·
@@ -856,6 +895,24 @@ def render_list(q, only_hits, flash=""):
 <div class="meta">{html.escape(fmt_date(r['meeting_date']))} {html.escape(r['meeting_type'] or '')} · {html.escape(r['source'] or '')}</div>
 <div>{tags} {status}</div>{first}<div class="links">{links}</div></div>""")
     return page_shell("Sewer Watch", "".join(out))
+
+
+def render_targets():
+    chosen = set(get_targets())
+    services = list_notify_services()
+    known = {s for s, _ in services}
+    services += [(s, nice_target(s) + " – not found in HA") for s in chosen if s not in known]
+    if not services:
+        boxes = '<div class="meta">Home Assistant didn\'t report any notify targets. Install the HA Companion app on your phone and log in, then reload this page.</div>'
+    else:
+        boxes = "".join(
+            f'<label class="pick"><input type="checkbox" name="target" value="{html.escape(s)}"'
+            f'{" checked" if s in chosen else ""}> {html.escape(label)}</label>'
+            for s, label in services)
+    warn = "" if chosen else '<div class="err"><b>Pick at least one phone, or you\'ll only get alerts inside Home Assistant.</b></div>'
+    return f"""<form class="card" method="post" action="targets"><b>Send alerts to</b>{warn}
+<div class="picks">{boxes}</div><div class="bar" style="margin:8px 0 0">
+<button>Save</button><button formaction="targets?test=1">Save &amp; send test</button></div></form>"""
 
 
 def render_doc(doc_id):
@@ -931,7 +988,22 @@ class Handler(BaseHTTPRequestHandler):
             self._send(page_shell("Error", f"<pre>{html.escape(str(e))}</pre>"), 500)
 
     def do_POST(self):
-        path = urlsplit(self.path).path.rstrip("/").rsplit("/", 1)[-1]
+        sp = urlsplit(self.path)
+        path = sp.path.rstrip("/").rsplit("/", 1)[-1]
+        if path == "targets":
+            n = int(self.headers.get("Content-Length") or 0)
+            form = parse_qs(self.rfile.read(n).decode() if n else "")
+            chosen = [t for t in form.get("target", []) if re.fullmatch(r"[a-z0-9_]+", t)]
+            kv_set("notify_targets", json.dumps(chosen))
+            log("alert targets:", chosen)
+            if chosen:
+                ha_call("POST", "/services/persistent_notification/dismiss", {"notification_id": "sewer_watch_setup"})
+            if parse_qs(sp.query).get("test") and chosen:
+                threading.Thread(target=send_test, daemon=True).start()
+                self._redirect(f"Saved. Test sent to {len(chosen)} target(s) - check your phone.")
+            else:
+                self._redirect("Saved." if chosen else "Saved - no phone selected, alerts will only appear inside Home Assistant.")
+            return
         if path == "check":
             CHECK_NOW.set()
             self._redirect("Checking the county site now - refresh in a minute.")
@@ -966,6 +1038,13 @@ def main():
     srv = ThreadingHTTPServer(("0.0.0.0", port), Handler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     log(f"reader UI on :{port} (panel {INGRESS_PANEL})")
+    if not get_targets():
+        ha_call("POST", "/services/persistent_notification/create", {
+            "notification_id": "sewer_watch_setup",
+            "title": "Sewer Watch: choose where alerts go",
+            "message": f"Open **[Sewer Watch]({INGRESS_PANEL})** in the sidebar and tick your phone under "
+                       "**Send alerts to**. It's already reading county documents in the meantime.",
+        })
     if os.environ.get("SW_ONCE") == "1":
         run_check()
         return

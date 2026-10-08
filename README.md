@@ -9,8 +9,8 @@ to the source.
 
 1. In Home Assistant, go to **Settings → Apps → App store** → ⋮ → **Repositories**.
 2. Add `https://github.com/Zouljiin/ha-sewer-watch`.
-3. Install **Sewer Watch**. On its **Configuration** tab, set `notify_service` to
-   your phone (for example `mobile_app_pixel_8`).
+3. Install **Sewer Watch**, start it, open it in the sidebar, and tick
+   your phone under **Send alerts to**.
 4. Start it and turn on **Show in sidebar**.
 
 See [sewer_watch/DOCS.md](sewer_watch/DOCS.md) for details.

@@ -16,21 +16,17 @@ scan. It then searches for your keywords and sends a push with the matching
 passages. The push has buttons for **Open PDF**, **Watch meeting**, and
 **Sewer Watch reader**.
 
-## Install (Home Assistant OS / Supervised, 2026.2+ where add-ons are "Apps")
+## Install
 
-1. **Settings → Apps → App store** (bottom right): install the **Samba share** app,
-   set a username/password on its Configuration tab, and start it.
-2. On your computer open `\\homeassistant.local` (Windows) or `smb://homeassistant.local`
-   (Mac). Copy this `sewer_watch` folder into the **`local_apps`** share so the path is
-   `local_apps/sewer_watch/config.yaml` (no extra folder level).
-3. **Settings → Apps → App store** → ⋮ (top right) → **Check for updates**, refresh the
-   page. **Sewer Watch** appears under **Local apps** at the top (Ctrl+F5 if not).
-4. Install (first build takes a few minutes). On **Configuration**, set
-   `notify_service` to your phone, e.g. `mobile_app_pixel_8` (Developer Tools → Actions,
-   search "notify.mobile_app"). Start it and turn on **Show in sidebar**.
+1. Go to **Settings → Apps → App store** → ⋮ → **Repositories**. Add
+   `https://github.com/Zouljiin/ha-sewer-watch`.
+2. Install **Sewer Watch**. Start it and turn on **Show in sidebar**.
+3. Open **Sewer Watch** in the sidebar. Under **Send alerts to**, tick your phone
+   (or several), then click **Save & send test**.
 
-If it doesn't appear: **Settings → System → Logs**, choose **Supervisor** in the
-top-right dropdown; the validation error is at the bottom.
+Phones appear in that list once the Home Assistant Companion app is installed
+and logged in on them. Until you pick one, alerts only show up in Home
+Assistant's own notifications.
 
 ### First run
 
@@ -42,18 +38,20 @@ documents.
 Older history is listed in the reader too. Opening an older document reads it
 on demand.
 
-## Options
+## Settings (Configuration tab)
 
-| Option | Meaning |
+| Setting | Meaning |
 |---|---|
-| `notify_service` | Your phone's notify service, without the `notify.` prefix |
-| `check_interval_minutes` | How often to check the county site |
-| `backfill_months` | How far back to read on first run |
-| `ocr` | OCR scanned PDFs (slower on a Raspberry Pi, but county minutes are often scans) |
-| `notify_every_new_document` | `false` = only alert when a document mentions a keyword |
-| `meeting_day_reminder` | Push on the morning of a meeting, with the livestream link |
-| `keywords` | What to search for (case-insensitive) |
-| `extra_pages` | Other pages to watch for new PDFs (for example, a Sanitation District page if one appears) |
+| How often to check the county site | Minutes between checks (180 = every 3 hours) |
+| How many months of past documents to read | How far back the first start reads |
+| Read scanned PDFs (OCR) | Needed for scanned minutes. Slower on a Raspberry Pi |
+| Alert on every new county document | Off = only alert when a keyword is mentioned |
+| Remind me on the morning of a meeting | Sends the livestream link and the sewer items on the agenda |
+| Words to watch for | Not case-sensitive |
+| Extra web pages to watch | Other pages to check for new PDFs |
+
+Where alerts go is set in the **Sewer Watch panel**, not here, so you can pick
+from a list of your phones.
 
 ## In Home Assistant
 
