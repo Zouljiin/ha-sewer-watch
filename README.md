@@ -9,8 +9,8 @@ to the source.
 
 1. In Home Assistant, go to **Settings → Apps → App store** → ⋮ → **Repositories**.
 2. Add `https://github.com/Zouljiin/ha-sewer-watch`.
-3. Install **Sewer Watch**, start it, open it in the sidebar, and tick
-   your phone under **Send alerts to**.
-4. Start it and turn on **Show in sidebar**.
+3. Install **Sewer Watch**. Start it and turn on **Show in sidebar**.
+4. Open **Sewer Watch** in the sidebar, tick your phone under **Send alerts to**,
+   and click **Save & send test**.
 
 See [sewer_watch/DOCS.md](sewer_watch/DOCS.md) for details.
