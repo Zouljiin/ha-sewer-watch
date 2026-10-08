@@ -1,0 +1,979 @@
+#!/usr/bin/env python3
+"""Sewer Watch - Home Assistant add-on.
+
+Watches the Spencer County, KY Fiscal Court website (agenda, minutes,
+meeting detail pages, public notices), downloads every PDF it finds,
+extracts the text (OCR for scans), searches it for sewer-related keywords
+and pushes notifications through Home Assistant with snippets and links.
+A small reader UI is served through HA ingress.
+
+Standard library only.
+"""
+import hashlib
+import html
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import traceback
+from datetime import date, datetime, timedelta
+from html.parser import HTMLParser
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, quote, unquote, urljoin, urlsplit, urlunsplit
+from urllib.request import Request, urlopen
+
+# --------------------------------------------------------------------------
+# Config
+# --------------------------------------------------------------------------
+SITE = "https://spencercountyky.gov"
+AGENDA_URL = SITE + "/nav/fiscal_court_agenda.php"
+MINUTES_URL = SITE + "/nav/meeting_minutes.php"
+NOTICES_URL = SITE + "/nav/public_notices.php"
+YOUTUBE_URL = "https://www.youtube.com/channel/UCPhTFTTwDIAuYU80APrPWUw"
+KDEP_URL = "https://eec.ky.gov/Environmental-Protection/Water/Pages/Water-Public-Notices-and-Hearings.aspx"
+
+DATA_DIR = os.environ.get("SW_DATA", "/data")
+OPTIONS_FILE = os.path.join(DATA_DIR, "options.json")
+DB_FILE = os.path.join(DATA_DIR, "sewer_watch.db")
+DRY_RUN = os.environ.get("SW_DRY") == "1"          # print instead of calling HA
+TOKEN = os.environ.get("SUPERVISOR_TOKEN", "")
+HA_API = "http://supervisor/core/api"
+UA = "Mozilla/5.0 (Home Assistant Sewer Watch add-on)"
+MAX_PDF_BYTES = 60 * 1024 * 1024
+MAX_OCR_PAGES = 40
+
+DEFAULTS = {
+    "notify_service": "",
+    "check_interval_minutes": 180,
+    "backfill_months": 12,
+    "ocr": True,
+    "notify_every_new_document": True,
+    "meeting_day_reminder": True,
+    "keywords": ["sewer", "sanitation", "top flight", "wastewater"],
+    "extra_pages": [],
+}
+
+
+def load_options():
+    opts = dict(DEFAULTS)
+    try:
+        with open(OPTIONS_FILE) as f:
+            opts.update(json.load(f))
+    except FileNotFoundError:
+        pass
+    opts["keywords"] = [k.strip() for k in opts.get("keywords", []) if k and k.strip()]
+    return opts
+
+
+OPTS = load_options()
+
+
+def log(*a):
+    print(time.strftime("%Y-%m-%d %H:%M:%S"), *a, flush=True)
+
+
+# --------------------------------------------------------------------------
+# Database
+# --------------------------------------------------------------------------
+DB_LOCK = threading.RLock()
+
+
+def db():
+    conn = sqlite3.connect(DB_FILE, timeout=30)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def db_init():
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with DB_LOCK, db() as c:
+        c.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS docs (
+              id INTEGER PRIMARY KEY,
+              base TEXT UNIQUE,         -- url without ?t=
+              url TEXT,                 -- full url incl. version
+              ver TEXT,
+              title TEXT,
+              meeting_date TEXT,        -- ISO date or ''
+              meeting_type TEXT,
+              source TEXT,
+              video TEXT,
+              details TEXT,
+              found_at TEXT,
+              indexed_at TEXT,
+              status TEXT,              -- listed | indexed | error
+              text TEXT,
+              hits TEXT,                -- json list of keywords
+              snippets TEXT             -- json list of strings
+            );
+            CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT);
+            """
+        )
+
+
+def kv_get(k, default=None):
+    with DB_LOCK, db() as c:
+        r = c.execute("SELECT v FROM kv WHERE k=?", (k,)).fetchone()
+    return r["v"] if r else default
+
+
+def kv_set(k, v):
+    with DB_LOCK, db() as c:
+        c.execute("INSERT INTO kv(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (k, str(v)))
+
+
+# --------------------------------------------------------------------------
+# HTTP + HTML
+# --------------------------------------------------------------------------
+def norm_url(u):
+    """Absolute URL with spaces etc. percent-encoded exactly once."""
+    p = urlsplit(u)
+    path = quote(unquote(p.path), safe="/()-_.~,+&'!$*;:@=")
+    query = quote(unquote(p.query), safe="=&/:+,;")
+    return urlunsplit((p.scheme or "https", p.netloc, path, query, ""))
+
+
+def split_version(u):
+    p = urlsplit(u)
+    q = parse_qs(p.query)
+    ver = (q.get("t") or [""])[0]
+    base = urlunsplit((p.scheme, p.netloc.lower(), unquote(p.path), "", ""))
+    return base, ver
+
+
+def fetch(url, binary=False, limit=8 * 1024 * 1024):
+    last = None
+    for attempt in range(3):
+        try:
+            req = Request(norm_url(url), headers={"User-Agent": UA})
+            with urlopen(req, timeout=90) as r:
+                data = r.read(limit + 1)
+            if len(data) > limit:
+                raise ValueError("response too large")
+            if binary:
+                return data
+            return data.decode("utf-8", errors="replace")
+        except Exception as e:  # noqa: BLE001
+            last = e
+            time.sleep(3 * (attempt + 1))
+    raise last
+
+
+BLOCK_TAGS = {"p", "br", "div", "li", "tr", "td", "th", "table", "ul", "ol",
+              "h1", "h2", "h3", "h4", "h5", "h6", "section", "article", "hr"}
+
+
+class Tokenizer(HTMLParser):
+    """Turns HTML into an ordered stream of ('text', s) / ('nl',) / ('link', href, text)."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.toks = []
+        self.skip = 0
+        self.a = None
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "base" and dict(attrs).get("href"):
+            self.toks.append(("base", dict(attrs)["href"]))
+        if tag in ("script", "style", "noscript", "head"):
+            self.skip += 1
+        if tag in BLOCK_TAGS:
+            self.toks.append(("nl",))
+        if tag == "a":
+            self.a = [dict(attrs).get("href") or "", []]
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style", "noscript", "head"):
+            self.skip = max(0, self.skip - 1)
+        if tag == "a" and self.a is not None:
+            self.toks.append(("link", self.a[0], " ".join(x for x in self.a[1] if x).strip()))
+            self.a = None
+        if tag in BLOCK_TAGS:
+            self.toks.append(("nl",))
+
+    def handle_startendtag(self, tag, attrs):
+        if tag == "base" and dict(attrs).get("href"):
+            self.toks.append(("base", dict(attrs)["href"]))
+        if tag in BLOCK_TAGS:
+            self.toks.append(("nl",))
+
+    def handle_data(self, d):
+        if self.skip:
+            return
+        if self.a is not None:
+            self.a[1].append(d.strip())
+        self.toks.append(("text", d))
+
+
+def tokenize(page):
+    t = Tokenizer()
+    t.feed(page)
+    t.close()
+    return t.toks
+
+
+def toks_text(toks):
+    out = []
+    for t in toks:
+        if t[0] == "text":
+            out.append(t[1])
+        elif t[0] == "nl":
+            out.append("\n")
+    lines = [re.sub(r"[ \t ]+", " ", ln).strip() for ln in "".join(out).split("\n")]
+    return "\n".join(ln for ln in lines if ln)
+
+
+def is_pdf(href):
+    return bool(re.search(r"\.pdf(\?|$)", href or "", re.I))
+
+
+def is_video(href):
+    return bool(re.search(r"youtu\.be/|youtube\.com/watch|facebook\.com/.+/videos/", href or "", re.I))
+
+
+def same_site(u):
+    return urlsplit(u).netloc.lower().endswith("spencercountyky.gov")
+
+
+def parse_mdy(s):
+    try:
+        return datetime.strptime(s, "%m/%d/%y").date()
+    except ValueError:
+        return None
+
+
+# --------------------------------------------------------------------------
+# Keyword search
+# --------------------------------------------------------------------------
+def kw_patterns():
+    pats = []
+    for k in OPTS["keywords"]:
+        pats.append((k, re.compile(r"(?<![a-z0-9])" + re.escape(k.lower()).replace(r"\ ", r"\s+"), re.I)))
+    return pats
+
+
+def find_hits(text, max_snips=8, radius=170):
+    if not text:
+        return [], []
+    spans, matched = [], []
+    for k, rx in kw_patterns():
+        for m in rx.finditer(text):
+            spans.append((max(0, m.start() - radius), min(len(text), m.end() + radius)))
+            if k not in matched:
+                matched.append(k)
+    spans.sort()
+    merged = []
+    for s, e in spans:
+        if merged and s <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(e, merged[-1][1]))
+        else:
+            merged.append((s, e))
+    snips = []
+    for s, e in merged[:max_snips]:
+        # start/end on sentence boundaries when one is close by
+        head = text[s:s + radius]
+        m = re.search(r"[.;:]\s+(?=[A-Z0-9])", head)
+        if m and s > 0:
+            s += m.end()
+        tail = text[max(s, e - radius):e]
+        m = None
+        for m in re.finditer(r"[.;]\s", tail):
+            pass
+        if m and e < len(text):
+            e = max(s, e - radius) + m.start() + 1
+        snip = re.sub(r"\s+", " ", text[s:e]).strip()
+        snips.append(("…" if s > 0 else "") + snip + ("…" if e < len(text) else ""))
+    return matched, snips
+
+
+# --------------------------------------------------------------------------
+# PDF text
+# --------------------------------------------------------------------------
+def pdf_text(data):
+    with tempfile.TemporaryDirectory() as td:
+        pdf = os.path.join(td, "doc.pdf")
+        with open(pdf, "wb") as f:
+            f.write(data)
+        text = ""
+        try:
+            text = subprocess.run(["pdftotext", "-layout", pdf, "-"], capture_output=True,
+                                  timeout=300).stdout.decode("utf-8", "replace")
+        except Exception as e:  # noqa: BLE001
+            log("pdftotext failed:", e)
+        if len(re.sub(r"\s", "", text)) >= 200 or not OPTS.get("ocr", True):
+            return text, "text"
+        # Scanned PDF: rasterize and OCR
+        try:
+            subprocess.run(["pdftoppm", "-r", "200", "-gray", "-png", "-l", str(MAX_OCR_PAGES),
+                            pdf, os.path.join(td, "pg")], check=True, timeout=900, capture_output=True)
+            pages = sorted(p for p in os.listdir(td) if p.startswith("pg") and p.endswith(".png"))
+            parts = []
+            for p in pages:
+                r = subprocess.run(["tesseract", os.path.join(td, p), "-", "--psm", "3"],
+                                   capture_output=True, timeout=300)
+                parts.append(r.stdout.decode("utf-8", "replace"))
+            ocr = "\n\f\n".join(parts)
+            if len(ocr.strip()) > len(text.strip()):
+                return ocr, "ocr"
+        except Exception as e:  # noqa: BLE001
+            log("OCR failed:", e)
+        return text, "text"
+
+
+# --------------------------------------------------------------------------
+# Home Assistant
+# --------------------------------------------------------------------------
+INGRESS_PANEL = "/hassio/ingress/local_sewer_watch"
+
+
+def ha_call(method, path, body=None, base=HA_API):
+    if DRY_RUN:
+        log("[DRY]", method, path, json.dumps(body, ensure_ascii=False)[:3000])
+        return None
+    req = Request(base + path, method=method,
+                  data=json.dumps(body).encode() if body is not None else None,
+                  headers={"Authorization": "Bearer " + TOKEN, "Content-Type": "application/json"})
+    try:
+        with urlopen(req, timeout=30) as r:
+            raw = r.read()
+            return json.loads(raw) if raw else None
+    except Exception as e:  # noqa: BLE001
+        log("HA call failed:", method, path, e)
+        return None
+
+
+def detect_panel():
+    global INGRESS_PANEL
+    info = ha_call("GET", "/addons/self/info", base="http://supervisor")
+    try:
+        slug = info["data"]["slug"]
+        INGRESS_PANEL = "/hassio/ingress/" + slug
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def notify(title, message, links=None, full=None, important=False):
+    """Phone push (short) + persistent notification (full) + event + logbook."""
+    links = [l for l in (links or []) if l and l[1]]
+    phone_msg = message if len(message) <= 1000 else message[:997] + "…"
+    actions = [{"action": "URI", "title": t[:24], "uri": u} for t, u in links[:3]]
+    first = links[0][1] if links else INGRESS_PANEL
+    svc = OPTS.get("notify_service", "").strip()
+    if svc.startswith("notify."):
+        svc = svc[7:]
+    if svc and svc != "mobile_app_CHANGE_ME":
+        ha_call("POST", "/services/notify/" + svc, {
+            "title": title,
+            "message": phone_msg,
+            "data": {
+                "url": first, "clickAction": first,
+                "actions": actions,
+                "group": "sewer_watch",
+                "priority": "high" if important else "normal",
+                "ttl": 0,
+                "push": {"interruption-level": "time-sensitive" if important else "active"},
+            },
+        })
+    else:
+        log("notify_service not set - only creating a persistent notification")
+    md_links = "\n".join(f"- [{t}]({u})" for t, u in links)
+    ha_call("POST", "/services/persistent_notification/create", {
+        "title": title,
+        "message": (full or message) + ("\n\n" + md_links if md_links else ""),
+    })
+    ha_call("POST", "/services/logbook/log", {"name": "Sewer Watch", "message": title})
+    ha_call("POST", "/events/sewer_watch_alert", {
+        "title": title, "message": message, "links": [{"title": t, "url": u} for t, u in links],
+        "important": important,
+    })
+
+
+def publish_status(ok, note=""):
+    with DB_LOCK, db() as c:
+        n = c.execute("SELECT COUNT(*) FROM docs WHERE status='indexed'").fetchone()[0]
+        nh = c.execute("SELECT COUNT(*) FROM docs WHERE hits IS NOT NULL AND hits!='[]'").fetchone()[0]
+        last = c.execute("SELECT * FROM docs WHERE status='indexed' ORDER BY found_at DESC, id DESC LIMIT 1").fetchone()
+        lasthit = c.execute("SELECT * FROM docs WHERE hits IS NOT NULL AND hits!='[]' "
+                            "ORDER BY meeting_date DESC, id DESC LIMIT 1").fetchone()
+    attrs = {
+        "friendly_name": "Sewer Watch",
+        "icon": "mdi:pipe-leak",
+        "last_check": datetime.now().isoformat(timespec="seconds"),
+        "note": note,
+        "agenda_date": kv_get("agenda_date", ""),
+        "agenda_keywords": kv_get("agenda_hits", ""),
+        "documents_indexed": n,
+        "documents_mentioning_keywords": nh,
+        "reader": INGRESS_PANEL,
+    }
+    if last:
+        attrs.update({"latest_document": last["title"], "latest_url": last["url"],
+                      "latest_meeting": last["meeting_date"]})
+    if lasthit:
+        attrs.update({"latest_mention": lasthit["title"], "latest_mention_url": lasthit["url"],
+                      "latest_mention_meeting": lasthit["meeting_date"],
+                      "latest_mention_keywords": ", ".join(json.loads(lasthit["hits"]))})
+    ha_call("POST", "/states/sensor.sewer_watch", {"state": "ok" if ok else "error", "attributes": attrs})
+
+
+# --------------------------------------------------------------------------
+# Scraping
+# --------------------------------------------------------------------------
+def join_base(page_url, toks):
+    """Revize pages set <base href>; documents live at the site root, so default there."""
+    for t in toks:
+        if t[0] == "base":
+            return urljoin(page_url, t[1])
+    return SITE + "/" if same_site(page_url) else page_url
+
+
+def minutes_entries(page, page_url):
+    """Each entry: date, type, list of (href, text). Entries are newest-first on the site."""
+    entries, cur = [], None
+    toks = tokenize(page)
+    jb = join_base(page_url, toks)
+    for t in toks:
+        if t[0] == "text":
+            m = re.match(r"\s*(\d{2}/\d{2}/\d{2})\b(.*)", t[1], re.S)
+            if m:
+                cur = {"date": parse_mdy(m.group(1)), "type": m.group(2).strip()[:80], "links": []}
+                entries.append(cur)
+                continue
+            if cur and not cur["type"] and re.search(r"meeting|hearing|session", t[1], re.I):
+                cur["type"] = t[1].strip()[:80]
+        elif t[0] == "link" and cur is not None and t[1]:
+            cur["links"].append((urljoin(jb, t[1].strip()), t[2]))
+    return [e for e in entries if e["date"]]
+
+
+def entry_docs(entry, source):
+    video = next((u for u, _ in entry["links"] if is_video(u)), "")
+    details = next((u for u, _ in entry["links"] if "agenda_details" in u.lower()), "")
+    docs = []
+    for u, txt in entry["links"]:
+        if is_pdf(u) and same_site(u):
+            docs.append({"url": u, "title": txt or os.path.basename(unquote(urlsplit(u).path)),
+                         "meeting_date": entry["date"].isoformat(), "meeting_type": entry["type"],
+                         "video": video, "details": details, "source": source})
+    return docs, details
+
+
+def page_pdf_docs(page, page_url, source, meeting_date=""):
+    docs = []
+    toks = tokenize(page)
+    jb = join_base(page_url, toks)
+    for t in toks:
+        if t[0] == "link" and t[1] and is_pdf(t[1]):
+            u = urljoin(jb, t[1].strip())
+            if same_site(u):
+                docs.append({"url": u, "title": t[2] or os.path.basename(unquote(urlsplit(u).path)),
+                             "meeting_date": meeting_date, "meeting_type": "", "video": "",
+                             "details": "", "source": source})
+    return docs
+
+
+def agenda_from_page(page):
+    text = toks_text(tokenize(page))
+    m = (re.search(r"(FY\s*\d\d/\d\d\s*AGENDA.*?)(?:Share this page|$)", text, re.S)
+         or re.search(r"((?:Regular|Special) Meeting\b.*?)(?:Share this page|$)", text, re.S))
+    agenda = m.group(1).strip() if m else ""
+    d = re.search(r"(January|February|March|April|May|June|July|August|September|October|"
+                  r"November|December)\s+(\d{1,2}),\s*(20\d\d)", agenda)
+    adate = ""
+    if d:
+        try:
+            adate = datetime.strptime(f"{d.group(1)} {d.group(2)} {d.group(3)}", "%B %d %Y").date().isoformat()
+        except ValueError:
+            pass
+    return agenda, adate
+
+
+def agenda_items(agenda):
+    items = []
+    for line in agenda.split("\n"):
+        for part in re.split(r"\s(?=(?:[A-L]|\d{1,2})\.\s)", line):
+            part = part.strip()
+            if part:
+                items.append(part)
+    return items
+
+
+# --------------------------------------------------------------------------
+# Indexing
+# --------------------------------------------------------------------------
+def index_doc(row_id):
+    with DB_LOCK, db() as c:
+        r = c.execute("SELECT * FROM docs WHERE id=?", (row_id,)).fetchone()
+    if not r:
+        return None
+    try:
+        data = fetch(r["url"], binary=True, limit=MAX_PDF_BYTES)
+        text, how = pdf_text(data)
+        hits, snips = find_hits(text)
+        with DB_LOCK, db() as c:
+            c.execute("UPDATE docs SET text=?, hits=?, snippets=?, status='indexed', indexed_at=? WHERE id=?",
+                      (text, json.dumps(hits), json.dumps(snips), datetime.now().isoformat(timespec="seconds"), row_id))
+        log(f"indexed [{how}] {r['title']} ({r['meeting_date']}) hits={hits}")
+    except Exception as e:  # noqa: BLE001
+        log("index failed", r["url"], e)
+        with DB_LOCK, db() as c:
+            c.execute("UPDATE docs SET status='error' WHERE id=?", (row_id,))
+    with DB_LOCK, db() as c:
+        return c.execute("SELECT * FROM docs WHERE id=?", (row_id,)).fetchone()
+
+
+def upsert(doc):
+    """Returns (row_id, change) where change is 'new', 'updated' or None."""
+    base, ver = split_version(doc["url"])
+    now = datetime.now().isoformat(timespec="seconds")
+    with DB_LOCK, db() as c:
+        r = c.execute("SELECT * FROM docs WHERE base=?", (base,)).fetchone()
+        if r is None:
+            cur = c.execute(
+                "INSERT INTO docs(base,url,ver,title,meeting_date,meeting_type,source,video,details,found_at,status)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?, 'listed')",
+                (base, norm_url(doc["url"]), ver, doc["title"], doc["meeting_date"], doc["meeting_type"],
+                 doc["source"], doc["video"], doc["details"], now))
+            return cur.lastrowid, "new"
+        # fill in metadata learned later (e.g. video added after the meeting)
+        c.execute("UPDATE docs SET video=COALESCE(NULLIF(?,''),video), details=COALESCE(NULLIF(?,''),details),"
+                  " meeting_date=COALESCE(NULLIF(meeting_date,''),?), meeting_type=COALESCE(NULLIF(meeting_type,''),?)"
+                  " WHERE id=?", (doc["video"], doc["details"], doc["meeting_date"], doc["meeting_type"], r["id"]))
+        if ver and ver != r["ver"]:
+            c.execute("UPDATE docs SET ver=?, url=? WHERE id=?", (ver, norm_url(doc["url"]), r["id"]))
+            return r["id"], "updated"
+        return r["id"], None
+
+
+def doc_links(r):
+    links = [("Open PDF", r["url"])]
+    if r["video"]:
+        links.append(("Watch meeting", r["video"]))
+    links.append(("Sewer Watch reader", INGRESS_PANEL))
+    return links
+
+
+def fmt_date(iso):
+    try:
+        d = date.fromisoformat(iso)
+        return d.strftime("%b %d, %Y").replace(" 0", " ")
+    except (TypeError, ValueError):
+        return iso or ""
+
+
+def alert_doc(r, change, prev_hits=None):
+    hits = json.loads(r["hits"] or "[]")
+    snips = json.loads(r["snippets"] or "[]")
+    when = fmt_date(r["meeting_date"])
+    what = f"{r['title']}" + (f" – {r['meeting_type']} {when}" if when else "")
+    verb = "Re-uploaded" if change == "updated" else "New"
+    if hits:
+        title = f"🚨 {verb}: {what}"
+        body = "Mentions: " + ", ".join(hits) + "\n\n" + "\n\n".join("• " + s for s in snips[:3])
+        full = ("**Mentions:** " + ", ".join(hits) + "\n\n" + "\n\n".join("> " + s for s in snips)
+                + f"\n\nSource: {r['source']}")
+    else:
+        title = f"{verb} county document: {what}"
+        body = "No sewer keywords found in this document."
+        if r["status"] == "error":
+            body = "Couldn't read this PDF - open it directly."
+        full = body + f"\n\nSource: {r['source']}"
+    notify(title, body, doc_links(r), full=full, important=bool(hits) and hits != (prev_hits or []))
+
+
+# --------------------------------------------------------------------------
+# One full check
+# --------------------------------------------------------------------------
+CHECK_LOCK = threading.Lock()
+
+
+def run_check():
+    if not CHECK_LOCK.acquire(blocking=False):
+        log("check already running")
+        return
+    try:
+        _run_check()
+        kv_set("last_success", datetime.now().isoformat(timespec="seconds"))
+        kv_set("site_alerted", "0")
+        publish_status(True)
+    except Exception as e:  # noqa: BLE001
+        log("CHECK FAILED:", e)
+        traceback.print_exc()
+        publish_status(False, str(e)[:200])
+    finally:
+        CHECK_LOCK.release()
+
+
+def _run_check():
+    initialized = kv_get("initialized") == "1"
+    cutoff = date.today() - timedelta(days=30 * int(OPTS.get("backfill_months", 12)))
+    found = []
+
+    # 1) minutes page -> entries -> PDFs (+ detail pages for recent meetings)
+    page = fetch(MINUTES_URL)
+    entries = minutes_entries(page, MINUTES_URL)
+    log(f"minutes page: {len(entries)} meetings listed")
+    recent_details = date.today() - timedelta(days=60)
+    for e in entries:
+        docs, details = entry_docs(e, "Meeting minutes page")
+        found += docs
+        if details and e["date"] >= max(cutoff if not initialized else recent_details, cutoff):
+            try:
+                dpage = fetch(details)
+                for d in page_pdf_docs(dpage, details, "Meeting details page", e["date"].isoformat()):
+                    d.update({"meeting_type": e["type"], "details": details,
+                              "video": next((u for u, _ in e["links"] if is_video(u)), "")})
+                    found.append(d)
+                time.sleep(1)
+            except Exception as ex:  # noqa: BLE001
+                log("details page failed", details, ex)
+
+    # 2) agenda page (text) + any PDFs on it
+    apage = fetch(AGENDA_URL)
+    agenda, adate = agenda_from_page(apage)
+    found += page_pdf_docs(apage, AGENDA_URL, "Fiscal Court agenda page", adate)
+
+    # 3) public notices + any extra pages the user added
+    for url, label in [(NOTICES_URL, "County public notices")] + [(u, "Extra page") for u in OPTS.get("extra_pages", [])]:
+        try:
+            found += page_pdf_docs(fetch(url), url, label)
+        except Exception as ex:  # noqa: BLE001
+            log("page failed", url, ex)
+
+    # de-dupe by base url, keep first (minutes entries carry the most metadata)
+    seen, uniq = set(), []
+    for d in found:
+        b = split_version(d["url"])[0]
+        if b not in seen:
+            seen.add(b)
+            uniq.append(d)
+    uniq.sort(key=lambda d: d["meeting_date"] or "9999", reverse=True)
+
+    new_alerts = 0
+    for d in uniq:
+        rid, change = upsert(d)
+        with DB_LOCK, db() as c:
+            r = c.execute("SELECT * FROM docs WHERE id=?", (rid,)).fetchone()
+        md = date.fromisoformat(r["meeting_date"]) if r["meeting_date"] else date.today()
+        in_window = md >= cutoff
+        if change is None and not (r["status"] == "listed" and in_window):
+            continue
+        if not in_window and change == "new" and not initialized:
+            continue                      # old history: list only, read on demand
+        prev_hits = json.loads(r["hits"] or "[]")
+        r = index_doc(rid)
+        time.sleep(1)
+        if not initialized or r is None or change is None:
+            continue
+        # skip the agenda PDF for the meeting whose agenda-page alert covers it
+        if change == "new" and "agenda" in (r["title"] or "").lower() and r["meeting_date"] == adate \
+                and not json.loads(r["hits"] or "[]"):
+            continue
+        hits = json.loads(r["hits"] or "[]")
+        if change == "updated" and hits == prev_hits:
+            continue                      # re-upload with nothing new to say
+        if hits or OPTS.get("notify_every_new_document", True) or r["status"] == "error":
+            alert_doc(r, change, prev_hits)
+            new_alerts += 1
+
+    # agenda text alert
+    if agenda:
+        h = hashlib.sha1(agenda.encode()).hexdigest()
+        hits, _ = find_hits(agenda)
+        kv_set("agenda_date", adate)
+        kv_set("agenda_hits", ", ".join(hits) or "none")
+        kv_set("agenda_text", agenda)
+        if h != kv_get("agenda_hash"):
+            kv_set("agenda_hash", h)
+            if initialized:
+                alert_agenda(agenda, adate, hits)
+    else:
+        log("WARNING: could not find agenda text on agenda page")
+
+    if not initialized:
+        kv_set("initialized", "1")
+        with DB_LOCK, db() as c:
+            n = c.execute("SELECT COUNT(*) FROM docs WHERE status='indexed'").fetchone()[0]
+            hitrows = c.execute("SELECT title, meeting_date, hits FROM docs WHERE hits IS NOT NULL AND hits!='[]'"
+                                " ORDER BY meeting_date DESC LIMIT 5").fetchall()
+        lines = [f"• {fmt_date(x['meeting_date'])}: {x['title']} ({', '.join(json.loads(x['hits']))})" for x in hitrows]
+        notify("Sewer Watch is running",
+               f"Read {n} county documents from the last {OPTS.get('backfill_months')} months. "
+               f"{len(hitrows) and 'Recent mentions:' or 'No sewer mentions found yet.'}\n" + "\n".join(lines)
+               + f"\n\nCurrent agenda: {fmt_date(adate)} – sewer keywords: {kv_get('agenda_hits')}",
+               [("Sewer Watch reader", INGRESS_PANEL), ("Fiscal Court agenda", AGENDA_URL)])
+    log(f"check done; {new_alerts} document alerts")
+
+
+def alert_agenda(agenda, adate, hits):
+    items = agenda_items(agenda)
+    rx = [p for _, p in kw_patterns()]
+    sewer_items = [i for i in items if any(p.search(i) for p in rx)]
+    when = fmt_date(adate)
+    links = [("Read agenda", AGENDA_URL), ("Livestream", YOUTUBE_URL), ("Sewer Watch reader", INGRESS_PANEL)]
+    with DB_LOCK, db() as c:
+        pdf = c.execute("SELECT url FROM docs WHERE meeting_date=? AND lower(title) LIKE '%agenda%' LIMIT 1",
+                        (adate,)).fetchone()
+    if pdf:
+        links.insert(1, ("Agenda PDF", pdf["url"]))
+    if sewer_items:
+        title = f"🚨 Sewer on the Fiscal Court agenda – {when}"
+        body = "\n".join("• " + i for i in sewer_items)
+    else:
+        title = f"New Fiscal Court agenda – {when}"
+        body = "No sewer items. On the agenda:\n" + "\n".join(
+            "• " + i for i in items if re.match(r"(?:\d{1,2})\.\s", i))[:700]
+    full = ("**Sewer-related items:**\n" + "\n".join("- " + i for i in sewer_items) + "\n\n" if sewer_items else "") \
+        + "**Full agenda:**\n\n" + agenda.replace("\n", "  \n")
+    notify(title, body, links[:4], full=full, important=bool(sewer_items))
+
+
+# --------------------------------------------------------------------------
+# Scheduler
+# --------------------------------------------------------------------------
+CHECK_NOW = threading.Event()
+
+
+def scheduler():
+    interval = max(30, int(OPTS.get("check_interval_minutes", 180))) * 60
+    next_run = 0
+    while True:
+        now = time.time()
+        if CHECK_NOW.is_set() or now >= next_run:
+            CHECK_NOW.clear()
+            run_check()
+            next_run = time.time() + interval
+        housekeeping()
+        CHECK_NOW.wait(60)
+
+
+def housekeeping():
+    today = date.today().isoformat()
+    # meeting-day reminder
+    if OPTS.get("meeting_day_reminder", True) and kv_get("agenda_date") == today \
+            and datetime.now().hour >= 7 and kv_get("reminded") != today:
+        kv_set("reminded", today)
+        hits = kv_get("agenda_hits", "none")
+        notify("Fiscal Court meets today",
+               f"Sewer keywords on today's agenda: {hits}. Regular meetings are 1st Monday 9:00am and "
+               "3rd Monday 7:00pm at 28 E. Main St, Taylorsville, and are livestreamed.",
+               [("Livestream", YOUTUBE_URL), ("Read agenda", AGENDA_URL)], important=hits != "none")
+    # site health
+    last = kv_get("last_success")
+    if last and kv_get("site_alerted") != "1":
+        try:
+            if datetime.now() - datetime.fromisoformat(last) > timedelta(hours=48):
+                kv_set("site_alerted", "1")
+                notify("Sewer Watch can't read the county site",
+                       "No successful check in 48 hours. The site may be down or redesigned - check the add-on log.",
+                       [("County site", SITE)])
+        except ValueError:
+            pass
+
+
+# --------------------------------------------------------------------------
+# Reader UI (ingress)
+# --------------------------------------------------------------------------
+CSS = """
+:root{--bg:#f6f7f9;--fg:#1c1f24;--mut:#667085;--card:#fff;--line:#e4e7ec;--acc:#0b6bcb;--hit:#fff3b0;--bad:#b42318}
+@media (prefers-color-scheme:dark){:root{--bg:#111418;--fg:#e6e8eb;--mut:#98a2b3;--card:#1a1e24;--line:#2b313a;--acc:#5aa9ff;--hit:#5c4a00;--bad:#ff6b5b}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+main{max-width:980px;margin:0 auto;padding:16px}a{color:var(--acc);text-decoration:none}a:hover{text-decoration:underline}
+h1{font-size:20px;margin:4px 0 12px}h2{font-size:16px;margin:20px 0 8px}
+.bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:12px}
+input[type=search]{flex:1;min-width:180px;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--fg)}
+button,.btn{padding:7px 12px;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--fg);cursor:pointer;font:inherit}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin:8px 0}
+.meta{color:var(--mut);font-size:13px}.tag{display:inline-block;background:var(--hit);border-radius:6px;padding:0 6px;margin:2px 4px 2px 0;font-size:12px}
+.links a{margin-right:12px;font-size:13px}mark{background:var(--hit);color:inherit;padding:0 2px;border-radius:3px}
+blockquote{margin:8px 0;padding:6px 10px;border-left:3px solid var(--acc);background:var(--bg);border-radius:4px}
+pre{white-space:pre-wrap;word-wrap:break-word;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px;font-size:13px}
+.err{color:var(--bad)}label{font-size:14px;color:var(--mut)}
+"""
+
+
+def hl(text):
+    esc = html.escape(text or "")
+    for _, rx in kw_patterns():
+        pat = re.compile(rx.pattern.replace(r"\s+", r"(?:\s|&nbsp;)+"), re.I)
+        esc = pat.sub(lambda m: f"<mark>{m.group(0)}</mark>", esc)
+    return esc
+
+
+def page_shell(title, body):
+    return f"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{html.escape(title)}</title><style>{CSS}</style></head><body><main>{body}</main></body></html>"""
+
+
+def render_list(q, only_hits, flash=""):
+    sql = "SELECT id,title,meeting_date,meeting_type,url,video,details,status,hits,snippets,source FROM docs WHERE 1=1"
+    args = []
+    if only_hits:
+        sql += " AND hits IS NOT NULL AND hits!='[]'"
+    if q:
+        sql += " AND (text LIKE ? OR title LIKE ?)"
+        args += [f"%{q}%", f"%{q}%"]
+    sql += " ORDER BY meeting_date DESC, id DESC LIMIT 150"
+    with DB_LOCK, db() as c:
+        rows = c.execute(sql, args).fetchall()
+        total = c.execute("SELECT COUNT(*) FROM docs").fetchone()[0]
+    adate, ahits = kv_get("agenda_date", ""), kv_get("agenda_hits", "")
+    out = [f"<h1>Sewer Watch</h1>"]
+    if flash:
+        out.append(f'<div class="card">{html.escape(flash)}</div>')
+    out.append(f"""<div class="card"><b>Current agenda:</b> {html.escape(fmt_date(adate))} &nbsp;
+<span class="meta">sewer keywords: {html.escape(ahits or '—')}</span> &nbsp; <a href="agenda">Read it</a> ·
+<a href="{AGENDA_URL}" target="_blank">County page</a> · <a href="{YOUTUBE_URL}" target="_blank">Livestream</a> ·
+<a href="{KDEP_URL}" target="_blank">State water permits</a>
+<div class="meta">Last check: {html.escape(kv_get('last_success', 'never') or 'never')} · {total} documents tracked</div></div>""")
+    out.append(f"""<form class="bar" method="get" action="./"><input type="search" name="q" value="{html.escape(q)}" placeholder="Search all document text (e.g. Top Flight, easement, draw)">
+<label><input type="checkbox" name="hits" value="1" {'checked' if only_hits else ''} onchange="this.form.submit()"> only sewer mentions</label>
+<button>Search</button></form>
+<div class="bar"><form method="post" action="check"><button>Check county site now</button></form>
+<form method="post" action="test"><button>Send test notification</button></form></div>""")
+    if not rows:
+        out.append('<div class="card meta">Nothing yet. The first check reads the last months of documents and can take a while (scanned PDFs are OCR\'d).</div>')
+    for r in rows:
+        hits = json.loads(r["hits"] or "[]")
+        snips = json.loads(r["snippets"] or "[]")
+        tags = "".join(f'<span class="tag">{html.escape(h)}</span>' for h in hits)
+        status = "" if r["status"] == "indexed" else (
+            '<span class="meta">not read yet (older than backfill) - open to read it</span>' if r["status"] == "listed"
+            else '<span class="err">could not read PDF</span>')
+        first = f"<blockquote>{hl(snips[0])}</blockquote>" if snips else ""
+        links = f'<a href="doc?id={r["id"]}">Read</a><a href="{html.escape(r["url"])}" target="_blank">PDF</a>'
+        if r["video"]:
+            links += f'<a href="{html.escape(r["video"])}" target="_blank">Video</a>'
+        if r["details"]:
+            links += f'<a href="{html.escape(r["details"])}" target="_blank">Meeting page</a>'
+        out.append(f"""<div class="card"><div><b><a href="doc?id={r['id']}">{html.escape(r['title'] or 'Document')}</a></b></div>
+<div class="meta">{html.escape(fmt_date(r['meeting_date']))} {html.escape(r['meeting_type'] or '')} · {html.escape(r['source'] or '')}</div>
+<div>{tags} {status}</div>{first}<div class="links">{links}</div></div>""")
+    return page_shell("Sewer Watch", "".join(out))
+
+
+def render_doc(doc_id):
+    with DB_LOCK, db() as c:
+        r = c.execute("SELECT * FROM docs WHERE id=?", (doc_id,)).fetchone()
+    if r is None:
+        return page_shell("Not found", '<p><a href="./">← back</a></p><p>Not found.</p>')
+    if r["status"] in ("listed", "error"):
+        r = index_doc(doc_id) or r
+    hits = json.loads(r["hits"] or "[]")
+    snips = json.loads(r["snippets"] or "[]")
+    links = f'<a href="{html.escape(r["url"])}" target="_blank">Open PDF</a>'
+    if r["video"]:
+        links += f' · <a href="{html.escape(r["video"])}" target="_blank">Meeting video</a>'
+    if r["details"]:
+        links += f' · <a href="{html.escape(r["details"])}" target="_blank">Meeting page</a>'
+    body = [f'<p><a href="./">← all documents</a></p><h1>{html.escape(r["title"] or "Document")}</h1>',
+            f'<div class="meta">{html.escape(fmt_date(r["meeting_date"]))} {html.escape(r["meeting_type"] or "")} · '
+            f'{html.escape(r["source"] or "")} · found {html.escape(r["found_at"] or "")}</div><p class="links">{links}</p>']
+    if hits:
+        body.append("<h2>Sewer-related mentions</h2>" + "".join(f'<span class="tag">{html.escape(h)}</span>' for h in hits))
+        body += [f"<blockquote>{hl(s)}</blockquote>" for s in snips]
+    elif r["status"] == "indexed":
+        body.append('<div class="card meta">No sewer keywords in this document.</div>')
+    if r["status"] == "error":
+        body.append('<div class="card err">Could not read this PDF. Use "Open PDF".</div>')
+    body.append(f"<h2>Full text</h2><pre>{hl(r['text'] or '')}</pre>")
+    return page_shell(r["title"] or "Document", "".join(body))
+
+
+def render_agenda():
+    agenda = kv_get("agenda_text", "")
+    return page_shell("Current agenda", f"""<p><a href="./">← all documents</a></p><h1>Fiscal Court agenda – {html.escape(fmt_date(kv_get('agenda_date','')))}</h1>
+<p class="links"><a href="{AGENDA_URL}" target="_blank">County agenda page</a> · <a href="{YOUTUBE_URL}" target="_blank">Livestream</a></p>
+<pre>{hl(agenda) if agenda else 'No agenda read yet.'}</pre>""")
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def _send(self, body, code=200, ctype="text/html; charset=utf-8"):
+        data = body.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _redirect(self, flash):
+        self.send_response(303)
+        self.send_header("Location", "./?flash=" + quote(flash))
+        self.end_headers()
+
+    def do_GET(self):
+        p = urlsplit(self.path)
+        q = parse_qs(p.query)
+        path = p.path.rstrip("/").rsplit("/", 1)[-1]
+        try:
+            if path == "doc":
+                self._send(render_doc(int(q.get("id", ["0"])[0])))
+            elif path == "agenda":
+                self._send(render_agenda())
+            elif path == "api":
+                self._send(json.dumps({"agenda_date": kv_get("agenda_date"), "agenda_hits": kv_get("agenda_hits")}),
+                           ctype="application/json")
+            else:
+                self._send(render_list(q.get("q", [""])[0].strip(), q.get("hits", ["0"])[0] == "1",
+                                       q.get("flash", [""])[0]))
+        except Exception as e:  # noqa: BLE001
+            traceback.print_exc()
+            self._send(page_shell("Error", f"<pre>{html.escape(str(e))}</pre>"), 500)
+
+    def do_POST(self):
+        path = urlsplit(self.path).path.rstrip("/").rsplit("/", 1)[-1]
+        if path == "check":
+            CHECK_NOW.set()
+            self._redirect("Checking the county site now - refresh in a minute.")
+        elif path == "test":
+            threading.Thread(target=send_test, daemon=True).start()
+            self._redirect("Test notification sent. If your phone didn't buzz, check notify_service in the add-on options.")
+        else:
+            self._send("not found", 404, "text/plain")
+
+
+def send_test():
+    with DB_LOCK, db() as c:
+        r = c.execute("SELECT * FROM docs WHERE hits IS NOT NULL AND hits!='[]' ORDER BY meeting_date DESC LIMIT 1").fetchone()
+    if r:
+        hits = json.loads(r["hits"])
+        snips = json.loads(r["snippets"] or "[]")
+        notify(f"TEST – latest mention: {r['title']} ({fmt_date(r['meeting_date'])})",
+               "Mentions: " + ", ".join(hits) + ("\n\n• " + snips[0] if snips else ""),
+               doc_links(r), important=True)
+    else:
+        notify("TEST – Sewer Watch works", "No sewer mentions found in the documents read so far.",
+               [("Sewer Watch reader", INGRESS_PANEL), ("Fiscal Court agenda", AGENDA_URL)], important=True)
+
+
+# --------------------------------------------------------------------------
+def main():
+    db_init()
+    log("Sewer Watch starting; keywords:", ", ".join(OPTS["keywords"]))
+    if not DRY_RUN:
+        detect_panel()
+    port = int(os.environ.get("SW_PORT", "8099"))
+    srv = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    log(f"reader UI on :{port} (panel {INGRESS_PANEL})")
+    if os.environ.get("SW_ONCE") == "1":
+        run_check()
+        return
+    scheduler()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(0)
